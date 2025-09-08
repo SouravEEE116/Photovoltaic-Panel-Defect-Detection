@@ -1,0 +1,618 @@
+step---1
+# ---------------------------
+#Imports & environment
+# ---------------------------
+import os
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import VGG16
+from tensorflow.keras.models import Model, Sequential
+from tensorflow.keras.layers import GlobalAveragePooling2D, Dense, Dropout, BatchNormalization
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping, ModelCheckpoint
+
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.preprocessing import StandardScaler, label_binarize
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report, confusion_matrix, roc_curve, auc
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import StackingClassifier
+
+import xgboost as xgb
+import joblib
+
+step---2
+# ---------------------------
+#Parameters & paths
+# ---------------------------
+DATA_DIR = "/kaggle/input/pv-panel-defect-dataset"  # update if needed
+WORK_DIR = "/kaggle/working"
+IMG_SIZE = (224, 224)
+BATCH_SIZE = 32
+EPOCHS = 30
+SEED = 42
+np.random.seed(SEED)
+
+step---3
+# ---------------------------
+#Data generators
+# ---------------------------
+train_datagen = ImageDataGenerator(
+    rescale=1./255,
+    rotation_range=25,
+    width_shift_range=0.1,
+    height_shift_range=0.1,
+    shear_range=0.12,
+    zoom_range=0.15,
+    horizontal_flip=True,
+    brightness_range=(0.7, 1.3),
+    fill_mode="nearest"
+)
+
+val_test_datagen = ImageDataGenerator(rescale=1./255)
+
+train_gen = train_datagen.flow_from_directory(
+    os.path.join(DATA_DIR, "train"),
+    target_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    class_mode="categorical",
+    shuffle=True,
+    seed=SEED
+)
+
+val_gen = val_test_datagen.flow_from_directory(
+    os.path.join(DATA_DIR, "val"),
+    target_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    class_mode="categorical",
+    shuffle=False
+)
+
+test_gen = val_test_datagen.flow_from_directory(
+    os.path.join(DATA_DIR, "test"),
+    target_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    class_mode="categorical",
+    shuffle=False
+)
+
+class_indices = train_gen.class_indices
+classes = list(class_indices.keys())
+NUM_CLASSES = len(classes)
+print(f"Found classes: {classes}")
+
+step---4
+# ---------------------------
+#Compute class weights (if imbalance)
+# ---------------------------
+y_train_labels = train_gen.classes
+class_weights = compute_class_weight(class_weight='balanced', classes=np.unique(y_train_labels), y=y_train_labels)
+class_weights_dict = {i: w for i, w in enumerate(class_weights)}
+print("Class weights:", class_weights_dict)
+
+step---5
+# ---------------------------
+#Build & fine-tune VGG16
+# ---------------------------
+base_model = VGG16(weights='imagenet', include_top=False, input_shape=(IMG_SIZE[0], IMG_SIZE[1], 3))
+
+# freeze all layers first
+for layer in base_model.layers:
+    layer.trainable = False
+
+# unfreeze last conv blocks for fine-tuning
+for layer in base_model.layers[-8:]:
+    layer.trainable = True
+
+x = GlobalAveragePooling2D()(base_model.output)
+x = BatchNormalization()(x)
+x = Dense(512, activation='relu')(x)
+x = Dropout(0.5)(x)
+x = Dense(256, activation='relu')(x)
+x = Dropout(0.3)(x)
+outputs = Dense(NUM_CLASSES, activation='softmax')(x)
+
+model = Model(inputs=base_model.input, outputs=outputs)
+model.compile(optimizer=Adam(learning_rate=1e-4), loss='categorical_crossentropy', metrics=['accuracy'])
+model.summary()
+
+# callbacks
+checkpoint_path = os.path.join(WORK_DIR, 'best_vgg16_finetuned.h5')
+callbacks = [
+    ModelCheckpoint(checkpoint_path, monitor='val_loss', save_best_only=True, verbose=1),
+    ReduceLROnPlateau(monitor='val_loss', factor=0.3, patience=3, verbose=1),
+    EarlyStopping(monitor='val_loss', patience=6, restore_best_weights=True, verbose=1)
+]
+
+step---6
+# ---------------------------
+#Train CNN model
+# ---------------------------
+history = model.fit(
+    train_gen,
+    epochs=EPOCHS,
+    validation_data=val_gen,
+    class_weight=class_weights_dict,
+    callbacks=callbacks
+)
+
+# save final weights
+model.save(os.path.join(WORK_DIR, 'vgg16_finetuned_final.h5'))
+
+
+step---7
+# ---------------------------
+#Plot training curves
+# ---------------------------
+plt.figure(figsize=(8,5))
+plt.plot(history.history['accuracy'], label='train_acc')
+plt.plot(history.history['val_accuracy'], label='val_acc')
+#plt.title('Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend()
+
+step---8
+# ---------------------------
+#Plot training curves
+# ---------------------------
+plt.figure(figsize=(8,5))
+plt.plot(history.history['loss'], label='train_loss')
+plt.plot(history.history['val_loss'], label='val_loss')
+#plt.title('Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+step---9
+# ---------------------------
+#Evaluate end-to-end CNN on test set
+# ---------------------------
+steps_test = math.ceil(test_gen.samples / BATCH_SIZE)
+probs_cnn = model.predict(test_gen, steps=steps_test, verbose=1)
+preds_cnn = np.argmax(probs_cnn, axis=1)
+true_labels = test_gen.classes
+
+acc_cnn = accuracy_score(true_labels, preds_cnn)
+prec_cnn = precision_score(true_labels, preds_cnn, average='weighted', zero_division=0)
+rec_cnn = recall_score(true_labels, preds_cnn, average='weighted', zero_division=0)
+f1_cnn = f1_score(true_labels, preds_cnn, average='weighted', zero_division=0)
+
+print("\nCNN End-to-End Results on Test Set")
+print(f"Accuracy: {acc_cnn*100:.2f}%")
+print(f"Precision: {prec_cnn*100:.2f}%")
+print(f"Recall: {rec_cnn*100:.2f}%")
+print(f"F1-score: {f1_cnn*100:.2f}%")
+print('\nClassification Report:\n', classification_report(true_labels, preds_cnn, target_names=classes))
+
+step---10
+# Confusion matrix
+cm = confusion_matrix(true_labels, preds_cnn)
+plt.figure(figsize=(8,5))
+sns.heatmap(cm, annot=True, fmt='d', xticklabels=classes, yticklabels=classes, cmap='Blues')
+plt.xlabel('Predicted')
+plt.ylabel('True')
+plt.title('Confusion Matrix - CNN')
+plt.show()
+
+step---11
+# ---------------------------
+#Feature extraction for ML classifiers
+# ---------------------------
+# Create a feature extractor model (use the fine-tuned base_model)
+feat_extractor = Model(inputs=base_model.input, outputs=GlobalAveragePooling2D()(base_model.output))
+
+# Helper: generator without augmentation for features (shuffle=False required)
+feat_gen = ImageDataGenerator(rescale=1./255)
+train_feat_gen = feat_gen.flow_from_directory(os.path.join(DATA_DIR, 'train'), target_size=IMG_SIZE, batch_size=BATCH_SIZE, class_mode='categorical', shuffle=False)
+val_feat_gen = feat_gen.flow_from_directory(os.path.join(DATA_DIR, 'val'), target_size=IMG_SIZE, batch_size=BATCH_SIZE, class_mode='categorical', shuffle=False)
+test_feat_gen = feat_gen.flow_from_directory(os.path.join(DATA_DIR, 'test'), target_size=IMG_SIZE, batch_size=BATCH_SIZE, class_mode='categorical', shuffle=False)
+
+# predict features
+steps_train = math.ceil(train_feat_gen.samples / BATCH_SIZE)
+steps_val = math.ceil(val_feat_gen.samples / BATCH_SIZE)
+steps_test = math.ceil(test_feat_gen.samples / BATCH_SIZE)
+
+X_train_feats = feat_extractor.predict(train_feat_gen, steps=steps_train, verbose=1)
+X_val_feats = feat_extractor.predict(val_feat_gen, steps=steps_val, verbose=1)
+X_test_feats = feat_extractor.predict(test_feat_gen, steps=steps_test, verbose=1)
+
+# features are already pooled -> shape (N, features)
+print('Feature shapes:', X_train_feats.shape, X_val_feats.shape, X_test_feats.shape)
+
+y_train = train_feat_gen.classes
+y_val = val_feat_gen.classes
+y_test = test_feat_gen.classes
+
+# Standardize features for SVM / Logistic Regression
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train_feats)
+X_val_scaled = scaler.transform(X_val_feats)
+X_test_scaled = scaler.transform(X_test_feats)
+
+# Save scaler
+joblib.dump(scaler, os.path.join(WORK_DIR, 'feature_scaler.pkl'))
+
+step---12
+# ---------------------------
+#Train classical ML classifiers
+# ---------------------------
+svm_clf = SVC(kernel='rbf', probability=True, class_weight='balanced', random_state=SEED)
+rf_clf = RandomForestClassifier(n_estimators=300, class_weight='balanced', random_state=SEED)
+xgb_clf = xgb.XGBClassifier(n_estimators=300, learning_rate=0.05, objective='multi:softprob', use_label_encoder=False, eval_metric='mlogloss', random_state=SEED)
+
+print('\nTraining SVM...')
+svm_clf.fit(X_train_scaled, y_train)
+print('Training RF...')
+rf_clf.fit(X_train_feats, y_train)  # RF works fine without scaling
+print('Training XGBoost...')
+xgb_clf.fit(X_train_feats, y_train)
+
+# Save models
+joblib.dump(svm_clf, os.path.join(WORK_DIR, 'svm_clf.pkl'))
+joblib.dump(rf_clf, os.path.join(WORK_DIR, 'rf_clf.pkl'))
+joblib.dump(xgb_clf, os.path.join(WORK_DIR, 'xgb_clf.pkl'))
+
+step---13
+# ---------------------------
+#Evaluate ML models on test set
+# ---------------------------
+models = {
+    'SVM': (svm_clf, X_test_scaled),
+    'RandomForest': (rf_clf, X_test_feats),
+    'XGBoost': (xgb_clf, X_test_feats)
+}
+
+ml_results = {}
+for name, (clf, Xtest) in models.items():
+    probs = clf.predict_proba(Xtest)
+    preds = np.argmax(probs, axis=1)
+    acc = accuracy_score(y_test, preds)
+    prec = precision_score(y_test, preds, average='weighted', zero_division=0)
+    rec = recall_score(y_test, preds, average='weighted', zero_division=0)
+    f1 = f1_score(y_test, preds, average='weighted', zero_division=0)
+    ml_results[name] = {'acc': acc, 'prec': prec, 'rec': rec, 'f1': f1, 'preds': preds, 'probs': probs}
+    print(f"\n{name} -> Acc: {acc*100:.2f}%, Prec: {prec*100:.2f}%, Rec: {rec*100:.2f}%, F1: {f1*100:.2f}%")
+    print(classification_report(y_test, preds, target_names=classes))
+
+# Confusion matrix for best ML model
+best_ml = max(ml_results.items(), key=lambda x: x[1]['acc'])[0]
+print('\nBest ML model:', best_ml)
+best_preds = ml_results[best_ml]['preds']
+cm_ml = confusion_matrix(y_test, best_preds)
+plt.figure(figsize=(8,5))
+sns.heatmap(cm_ml, annot=True, fmt='d', xticklabels=classes, yticklabels=classes, cmap='Blues')
+#plt.title(f'Confusion Matrix - {best_ml}')
+plt.xlabel('Predicted')
+plt.ylabel('True')
+plt.show()
+
+step---14
+# ---------------------------
+#ROC Curves (multiclass) for best ML model
+# ---------------------------
+# Binarize labels
+y_test_binarized = label_binarize(y_test, classes=list(range(NUM_CLASSES)))
+probs_best = ml_results[best_ml]['probs']
+
+plt.figure(figsize=(8,5))
+for i in range(NUM_CLASSES):
+    fpr, tpr, _ = roc_curve(y_test_binarized[:, i], probs_best[:, i])
+    roc_auc = auc(fpr, tpr)
+    plt.plot(fpr, tpr, label=f"{classes[i]} (AUC = {roc_auc:.2f})")
+plt.plot([0,1], [0,1], 'k--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+#plt.title(f'ROC Curves - {best_ml}')
+plt.legend()
+plt.show()
+
+step---15
+# ---------------------------
+#Stacking Ensemble (SVM + RF + XGB -> Logistic Regression)
+# ---------------------------
+estimators = [
+    ('svm', SVC(kernel='rbf', probability=True, class_weight='balanced', random_state=SEED)),
+    ('rf', RandomForestClassifier(n_estimators=200, class_weight='balanced', random_state=SEED)),
+    ('xgb', xgb.XGBClassifier(n_estimators=200, learning_rate=0.05, use_label_encoder=False, eval_metric='mlogloss', random_state=SEED))
+]
+stack_clf = StackingClassifier(estimators=estimators, final_estimator=LogisticRegression(max_iter=1000), n_jobs=-1, passthrough=False)
+
+# Fit stacking on training features (we'll use scaled features)
+print('\nTraining stacking ensemble...')
+stack_clf.fit(X_train_scaled, y_train)
+joblib.dump(stack_clf, os.path.join(WORK_DIR, 'stacking_clf.pkl'))
+
+probs_stack = stack_clf.predict_proba(X_test_scaled)
+preds_stack = np.argmax(probs_stack, axis=1)
+acc_stack = accuracy_score(y_test, preds_stack)
+print(f"Stacking ensemble accuracy: {acc_stack*100:.2f}%")
+print(classification_report(y_test, preds_stack, target_names=classes))
+
+step---16
+import matplotlib.pyplot as plt
+from tensorflow.keras.preprocessing import image
+import numpy as np
+import os
+
+n_samples_per_class = 5
+
+# Collect filenames and true labels
+filenames = test_feat_gen.filenames
+y_true = y_test
+
+# Group image indices by class
+class_indices_dict = {cls: [] for cls in classes}
+for idx, label_idx in enumerate(y_true):
+    class_indices_dict[classes[label_idx]].append(idx)
+
+# Loop through each class
+for cls in classes:
+    indices = class_indices_dict[cls][:n_samples_per_class]  # first 5 samples
+    
+    for idx in indices:
+        img_path = os.path.join(DATA_DIR, 'test', filenames[idx])
+        img = image.load_img(img_path, target_size=IMG_SIZE)
+        arr = image.img_to_array(img) / 255.0
+
+        # Get features & predictions
+        feat = feat_extractor.predict(np.expand_dims(arr, axis=0))
+        feat_scaled = scaler.transform(feat)
+        probs = stack_clf.predict_proba(feat_scaled)
+        pred_idx = np.argmax(probs)
+        pred_label = classes[pred_idx]
+        pred_conf = probs[0, pred_idx] * 100
+
+        true_label = cls
+
+        # Display single image in a separate figure
+        plt.figure(figsize=(5,5))
+        plt.imshow(img)
+        color = 'green' if pred_label == true_label else 'red'
+        plt.title(f"True: {true_label}\nPred: {pred_label} ({pred_conf:.1f}%)", color=color, fontsize=12)
+        plt.axis('off')
+        plt.show()
+
+step---17
+# ---------------------------
+# Imports
+# ---------------------------
+import os, math
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import ResNet50, DenseNet169, MobileNetV2, InceptionV3
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import GlobalAveragePooling2D
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier, StackingClassifier
+from sklearn.linear_model import LogisticRegression
+import xgboost as xgb
+import pandas as pd
+
+step---18
+# ---------------------------
+# Parameters
+# ---------------------------
+DATA_DIR = "/kaggle/input/pv-panel-defect-dataset"
+IMG_SIZE = (224, 224)
+BATCH_SIZE = 32
+SEED = 42
+np.random.seed(SEED)
+
+step---19
+# ---------------------------
+# Data Generators (no augmentation)
+# ---------------------------
+val_test_datagen = ImageDataGenerator(rescale=1./255)
+
+train_feat_gen = val_test_datagen.flow_from_directory(
+    os.path.join(DATA_DIR, 'train'),
+    target_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    class_mode='categorical',
+    shuffle=False
+)
+
+test_feat_gen = val_test_datagen.flow_from_directory(
+    os.path.join(DATA_DIR, 'test'),
+    target_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    class_mode='categorical',
+    shuffle=False
+)
+
+classes = list(train_feat_gen.class_indices.keys())
+NUM_CLASSES = len(classes)
+y_train = train_feat_gen.classes
+y_test = test_feat_gen.classes
+
+
+step---20
+# ---------------------------
+# CNN Feature Extractor Function
+# ---------------------------
+def create_cnn_base(name="ResNet50"):
+    if name=="ResNet50":
+        base_model = ResNet50(weights='imagenet', include_top=False, input_shape=(IMG_SIZE[0], IMG_SIZE[1], 3))
+        for layer in base_model.layers[:-30]: layer.trainable=False
+        for layer in base_model.layers[-30:]: layer.trainable=True
+    elif name=="DenseNet169":
+        base_model = DenseNet169(weights='imagenet', include_top=False, input_shape=(IMG_SIZE[0], IMG_SIZE[1], 3))
+        for layer in base_model.layers[:-20]: layer.trainable=False
+        for layer in base_model.layers[-20:]: layer.trainable=True
+    elif name=="MobileNetV2":
+        base_model = MobileNetV2(weights='imagenet', include_top=False, input_shape=(IMG_SIZE[0], IMG_SIZE[1], 3))
+        for layer in base_model.layers[:-20]: layer.trainable=False
+        for layer in base_model.layers[-20:]: layer.trainable=True
+    elif name=="InceptionV3":
+        base_model = InceptionV3(weights='imagenet', include_top=False, input_shape=(IMG_SIZE[0], IMG_SIZE[1], 3))
+        for layer in base_model.layers[:-50]: layer.trainable=False
+        for layer in base_model.layers[-50:]: layer.trainable=True
+    else:
+        raise ValueError("Unknown model name")
+    feat_model = Model(inputs=base_model.input, outputs=GlobalAveragePooling2D()(base_model.output))
+    return feat_model
+
+step---21
+# ---------------------------
+# Feature extraction
+# ---------------------------
+def extract_features(feat_model, generator):
+    steps = math.ceil(generator.samples / BATCH_SIZE)
+    feats = feat_model.predict(generator, steps=steps, verbose=1)
+    return feats
+
+step---22
+# ---------------------------
+# Classical ML Training & Evaluation
+# ---------------------------
+def train_evaluate_ml(X_train, y_train, X_test, y_test):
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    svm_clf = SVC(kernel='rbf', probability=True, class_weight='balanced', random_state=SEED)
+    rf_clf = RandomForestClassifier(n_estimators=300, class_weight='balanced', random_state=SEED)
+    xgb_clf = xgb.XGBClassifier(n_estimators=300, learning_rate=0.05, use_label_encoder=False, eval_metric='mlogloss', random_state=SEED)
+
+    # Train classifiers
+    svm_clf.fit(X_train_scaled, y_train)
+    rf_clf.fit(X_train, y_train)
+    xgb_clf.fit(X_train, y_train)
+
+    # Evaluate
+    results = {}
+    for name, clf, X_eval in zip(['SVM','RF','XGB'], [svm_clf, rf_clf, xgb_clf], [X_test_scaled, X_test, X_test]):
+        preds = clf.predict(X_eval)
+        results[name] = {
+            'acc': accuracy_score(y_test, preds),
+            'prec': precision_score(y_test, preds, average='weighted'),
+            'rec': recall_score(y_test, preds, average='weighted'),
+            'f1': f1_score(y_test, preds, average='weighted')
+        }
+
+    # Stacking ensemble
+    estimators = [('svm', svm_clf), ('rf', rf_clf), ('xgb', xgb_clf)]
+    stack_clf = StackingClassifier(estimators=estimators, final_estimator=LogisticRegression(max_iter=1000), n_jobs=-1)
+    stack_clf.fit(X_train_scaled, y_train)
+    preds_stack = stack_clf.predict(X_test_scaled)
+    results['Stacking'] = {
+        'acc': accuracy_score(y_test, preds_stack),
+        'prec': precision_score(y_test, preds_stack, average='weighted'),
+        'rec': recall_score(y_test, preds_stack, average='weighted'),
+        'f1': f1_score(y_test, preds_stack, average='weighted')
+    }
+
+    return results
+
+step---23
+# ---------------------------
+# Comparison Pipeline
+# ---------------------------
+cnn_models = ["ResNet50","DenseNet169","MobileNetV2","InceptionV3"]
+comparison_results = {}
+
+for name in cnn_models:
+    print(f"\n=== Extracting features from {name} ===")
+    feat_model = create_cnn_base(name)
+    X_train = extract_features(feat_model, train_feat_gen)
+    X_test = extract_features(feat_model, test_feat_gen)
+    results = train_evaluate_ml(X_train, y_train, X_test, y_test)
+    comparison_results[name] = results
+
+step---24
+# ---------------------------
+# Display results table
+# ---------------------------
+rows = []
+for cnn_name, res in comparison_results.items():
+    for model_name, metrics in res.items():
+        rows.append([cnn_name, model_name, metrics['acc']*100, metrics['prec']*100, metrics['rec']*100, metrics['f1']*100])
+
+df = pd.DataFrame(rows, columns=['CNN Backbone','ML Model','Accuracy','Precision','Recall','F1-score'])
+print(df)
+
+step---25
+# ---------------------------
+# Confusion Matrix for Best Model per CNN Backbone
+# ---------------------------
+from sklearn.metrics import confusion_matrix
+import seaborn as sns
+import matplotlib.pyplot as plt
+import numpy as np
+
+for cnn_name, res in comparison_results.items():
+    # Identify best ML model based on accuracy
+    best_model_name = max(res.items(), key=lambda x: x[1]['acc'])[0]
+    print(f"\nCNN Backbone: {cnn_name} -> Best ML Model: {best_model_name}")
+    
+    # Extract predictions
+    if best_model_name == 'SVM':
+        # SVM used scaled features
+        feat_model = create_cnn_base(cnn_name)
+        X_test_feats = extract_features(feat_model, test_feat_gen)
+        scaler = StandardScaler()
+        X_train_feats = extract_features(feat_model, train_feat_gen)
+        X_train_scaled = scaler.fit_transform(X_train_feats)
+        X_test_scaled = scaler.transform(X_test_feats)
+        clf = SVC(kernel='rbf', probability=True, class_weight='balanced', random_state=SEED)
+        y_train_feats = train_feat_gen.classes
+        clf.fit(X_train_scaled, y_train_feats)
+        y_pred = clf.predict(X_test_scaled)
+    elif best_model_name == 'RF':
+        feat_model = create_cnn_base(cnn_name)
+        X_train_feats = extract_features(feat_model, train_feat_gen)
+        X_test_feats = extract_features(feat_model, test_feat_gen)
+        clf = RandomForestClassifier(n_estimators=300, class_weight='balanced', random_state=SEED)
+        y_train_feats = train_feat_gen.classes
+        clf.fit(X_train_feats, y_train_feats)
+        y_pred = clf.predict(X_test_feats)
+    elif best_model_name == 'XGB':
+        feat_model = create_cnn_base(cnn_name)
+        X_train_feats = extract_features(feat_model, train_feat_gen)
+        X_test_feats = extract_features(feat_model, test_feat_gen)
+        clf = xgb.XGBClassifier(n_estimators=300, learning_rate=0.05, use_label_encoder=False, eval_metric='mlogloss', random_state=SEED)
+        y_train_feats = train_feat_gen.classes
+        clf.fit(X_train_feats, y_train_feats)
+        y_pred = clf.predict(X_test_feats)
+    elif best_model_name == 'Stacking':
+        feat_model = create_cnn_base(cnn_name)
+        X_train_feats = extract_features(feat_model, train_feat_gen)
+        X_test_feats = extract_features(feat_model, test_feat_gen)
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train_feats)
+        X_test_scaled = scaler.transform(X_test_feats)
+        svm_clf = SVC(kernel='rbf', probability=True, class_weight='balanced', random_state=SEED)
+        rf_clf = RandomForestClassifier(n_estimators=300, class_weight='balanced', random_state=SEED)
+        xgb_clf = xgb.XGBClassifier(n_estimators=300, learning_rate=0.05, use_label_encoder=False, eval_metric='mlogloss', random_state=SEED)
+        stack_clf = StackingClassifier(estimators=[('svm', svm_clf), ('rf', rf_clf), ('xgb', xgb_clf)],
+                                       final_estimator=LogisticRegression(max_iter=1000), n_jobs=-1)
+        y_train_feats = train_feat_gen.classes
+        stack_clf.fit(X_train_scaled, y_train_feats)
+        y_pred = stack_clf.predict(X_test_scaled)
+    
+    # Confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+    plt.figure(figsize=(8,5))
+    sns.heatmap(cm, annot=True, fmt='d', xticklabels=classes, yticklabels=classes, cmap='Blues')
+    plt.title(f'Confusion Matrix - {cnn_name} ({best_model_name})')
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.show()
